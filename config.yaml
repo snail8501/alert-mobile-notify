@@ -1,0 +1,24 @@
+
+wechat:
+  # 企业微信机器人webhook地址，请替换为实际地址
+  webhook_url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx"
+
+# EC600N 4G模块配置
+ec600n:
+  # 是否启用EC600N功能（设置为true启用，false禁用）
+  enabled: false
+  # 串口设备路径（树莓派上通常是/dev/ttyUSB0或/dev/ttyACM0）
+  serial_port: "/dev/ttyUSB2"
+  # 波特率
+  baud_rate: 115200
+  # 通话时长（秒）
+  call_duration: 60
+  # 网络状态检查间隔（分钟）
+  network_check_interval: 30
+
+logger:
+  fileName: mobile-notify.log
+  path: logs/
+  maxAge: 5
+  maxSize: 20
+  maxBackups: 15
