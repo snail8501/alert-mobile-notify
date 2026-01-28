@@ -4,7 +4,6 @@ import (
 	"alert-mobile-notify/config"
 	"alert-mobile-notify/notification"
 	"bufio"
-	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -20,18 +19,6 @@ const (
 	MaxResponseLines  = 10                     // 最大响应行数
 	MinSignalStrength = 5                      // 最小正常信号强度
 	IMEILength        = 15                     // IMEI 标准长度
-)
-
-// CallStatus 通话状态
-type CallStatus string
-
-const (
-	CallStatusConnected CallStatus = "CONNECTED"  // 通话已建立
-	CallStatusHangup    CallStatus = "HANGUP"     // 对方挂断
-	CallStatusBusy      CallStatus = "BUSY"       // 对方忙线
-	CallStatusNoAnswer  CallStatus = "NO_ANSWER"  // 无人接听
-	CallStatusNoCarrier CallStatus = "NO_CARRIER" // 无载波/连接断开
-	CallStatusError     CallStatus = "ERROR"      // 错误
 )
 
 var (
@@ -307,144 +294,6 @@ func (e *EC600N) MakeCall(phoneNumber string) error {
 	}
 
 	return fmt.Errorf("拨打电话失败，响应: %s", response)
-}
-
-// monitorCallStatus 持续监听通话状态
-// 返回一个channel，用于接收通话状态变化
-func (e *EC600N) monitorCallStatus(ctx context.Context) <-chan CallStatus {
-	statusChan := make(chan CallStatus, 1)
-
-	go func() {
-		defer close(statusChan)
-
-		if e.port == nil {
-			statusChan <- CallStatusError
-			return
-		}
-
-		reader := bufio.NewReader(e.port)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				// 使用带超时的读取
-				lineChan := make(chan string, 1)
-				errChan := make(chan error, 1)
-
-				go func() {
-					line, err := reader.ReadString('\n')
-					if err != nil {
-						errChan <- err
-						return
-					}
-					lineChan <- line
-				}()
-
-				select {
-				case <-ctx.Done():
-					return
-				case line := <-lineChan:
-					// 处理读取到的行
-					line = strings.TrimSpace(line)
-					lineUpper := strings.ToUpper(line)
-
-					// 检测各种状态码
-					switch {
-					case strings.Contains(lineUpper, "NO CARRIER"):
-						zap.S().Info("检测到对方挂断: NO CARRIER")
-						select {
-						case statusChan <- CallStatusNoCarrier:
-						case <-ctx.Done():
-							return
-						}
-						return
-					case strings.Contains(lineUpper, "BUSY"):
-						zap.S().Info("检测到对方忙线: BUSY")
-						select {
-						case statusChan <- CallStatusBusy:
-						case <-ctx.Done():
-							return
-						}
-						return
-					case strings.Contains(lineUpper, "NO ANSWER"):
-						zap.S().Info("检测到无人接听: NO ANSWER")
-						select {
-						case statusChan <- CallStatusNoAnswer:
-						case <-ctx.Done():
-							return
-						}
-						return
-					case strings.Contains(lineUpper, "CONNECT"):
-						zap.S().Info("检测到通话建立: CONNECT")
-						select {
-						case statusChan <- CallStatusConnected:
-						case <-ctx.Done():
-							return
-						}
-					case strings.Contains(lineUpper, "ERROR"):
-						zap.S().Warn("检测到错误状态: ERROR")
-						select {
-						case statusChan <- CallStatusError:
-						case <-ctx.Done():
-							return
-						}
-					}
-				case <-errChan:
-					// 读取错误，继续循环
-					time.Sleep(100 * time.Millisecond)
-					continue
-				case <-time.After(500 * time.Millisecond):
-					// 读取超时，继续循环
-					continue
-				}
-			}
-		}
-	}()
-
-	return statusChan
-}
-
-// MakeCallWithMonitor 拨打电话并监听状态
-// 返回拨号错误和状态监听channel
-func (e *EC600N) MakeCallWithMonitor(phoneNumber string) (<-chan CallStatus, error) {
-	if e.port == nil {
-		return nil, fmt.Errorf("串口未连接")
-	}
-
-	// 清理电话号码
-	phoneNumber = strings.TrimSpace(phoneNumber)
-	phoneNumber = strings.ReplaceAll(phoneNumber, "-", "")
-	phoneNumber = strings.ReplaceAll(phoneNumber, " ", "")
-
-	if phoneNumber == "" {
-		return nil, fmt.Errorf("电话号码不能为空")
-	}
-
-	// 创建监听上下文
-	ctx, cancel := context.WithCancel(context.Background())
-	_ = cancel // 稍后会在适当的时候调用
-
-	// 启动状态监听
-	statusChan := e.monitorCallStatus(ctx)
-
-	// 发送拨号指令
-	command := fmt.Sprintf("ATD%s;", phoneNumber)
-	response, err := e.sendATCommand(command)
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("发送拨号指令失败: %w", err)
-	}
-
-	// 检查响应
-	if strings.Contains(response, "OK") || strings.Contains(response, "CONNECT") {
-		zap.S().Infof("拨打电话成功: %s", phoneNumber)
-		// 返回带取消函数的channel包装
-		return statusChan, nil
-	}
-
-	cancel()
-	return nil, fmt.Errorf("拨打电话失败，响应: %s", response)
 }
 
 // HangupCall 挂断电话

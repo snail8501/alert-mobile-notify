@@ -216,101 +216,57 @@ func (s *HTTPServer) sendWechatNotification(name string, phoneNumbers []string) 
 	}
 }
 
-// makePhoneCall 拨打电话并监听对方挂断
-func (s *HTTPServer) makePhoneCall(phoneNumber string, maxDuration int) string {
+// makePhoneCall 拨打电话
+func (s *HTTPServer) makePhoneCall(phoneNumber string, duration int) string {
 	zap.S().Infof("开始拨打电话: %s", phoneNumber)
-
-	// 使用带监听功能的拨号方法
-	statusChan, err := s.ec600n.MakeCallWithMonitor(phoneNumber)
-	if err != nil {
+	if err := s.ec600n.MakeCall(phoneNumber); err != nil {
 		zap.S().Errorf("拨打电话失败 [%s]: %v", phoneNumber, err)
 		return fmt.Sprintf("%s: 失败 - %v", phoneNumber, err)
 	}
 
-	// 创建超时context
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(maxDuration)*time.Second)
-	defer cancel()
+	zap.S().Infof("通话中，等待 %d 秒后挂断...", duration)
+	time.Sleep(time.Duration(duration) * time.Second)
 
-	zap.S().Infof("通话中，监听对方挂断或等待 %d 秒后挂断...", maxDuration)
-
-	// 使用select监听两个事件：对方挂断或超时
-	select {
-	case status := <-statusChan:
-		// 检测到状态变化
-		switch status {
-		case ec600n.CallStatusNoCarrier:
-			zap.S().Infof("检测到对方已挂断: %s", phoneNumber)
-			return fmt.Sprintf("%s: 成功（对方已挂断）", phoneNumber)
-		case ec600n.CallStatusBusy:
-			zap.S().Warnf("对方忙线: %s", phoneNumber)
-			return fmt.Sprintf("%s: 对方忙线", phoneNumber)
-		case ec600n.CallStatusNoAnswer:
-			zap.S().Warnf("无人接听: %s", phoneNumber)
-			return fmt.Sprintf("%s: 无人接听", phoneNumber)
-		case ec600n.CallStatusError:
-			zap.S().Errorf("通话错误: %s", phoneNumber)
-			// 尝试挂断
-			if hangupErr := s.ec600n.HangupCall(); hangupErr != nil {
-				return fmt.Sprintf("%s: 通话错误且挂断失败 - %v", phoneNumber, hangupErr)
-			}
-			return fmt.Sprintf("%s: 通话错误", phoneNumber)
-		default:
-			zap.S().Infof("通话状态: %s, 电话: %s", status, phoneNumber)
-			// 继续等待或挂断
-			if hangupErr := s.ec600n.HangupCall(); hangupErr != nil {
-				return fmt.Sprintf("%s: 挂断失败 - %v", phoneNumber, hangupErr)
-			}
-			return fmt.Sprintf("%s: 成功", phoneNumber)
-		}
-	case <-ctx.Done():
-		// 超时，主动挂断
-		zap.S().Infof("通话超时，主动挂断: %s", phoneNumber)
-		if err := s.ec600n.HangupCall(); err != nil {
-			zap.S().Errorf("挂断电话失败 [%s]: %v", phoneNumber, err)
-			return fmt.Sprintf("%s: 超时但挂断失败 - %v", phoneNumber, err)
-		}
-		zap.S().Infof("电话已挂断: %s", phoneNumber)
-		return fmt.Sprintf("%s: 成功（超时挂断）", phoneNumber)
+	if err := s.ec600n.HangupCall(); err != nil {
+		zap.S().Errorf("挂断电话失败 [%s]: %v", phoneNumber, err)
+		return fmt.Sprintf("%s: 拨打成功但挂断失败 - %v", phoneNumber, err)
 	}
+
+	zap.S().Infof("电话已挂断: %s", phoneNumber)
+	return fmt.Sprintf("%s: 成功", phoneNumber)
 }
 
 // processPhoneCalls 处理拨打电话流程
 // 只处理第一个电话号码并返回结果，其他电话号码异步执行
-func (s *HTTPServer) processPhoneCalls(name string, phoneNumbersStr string) []string {
+func (s *HTTPServer) processPhoneCalls(name string, phoneNumbersStr string) error {
 	if phoneNumbersStr == "" || s.ec600n == nil || !s.ec600n.IsConnected() {
 		if s.ec600n == nil || !s.ec600n.IsConnected() {
 			zap.S().Warn("EC600N 模块未启用或未连接，跳过拨打电话")
-			return []string{"EC600N 模块未启用或未连接"}
+			return fmt.Errorf("EC600N 模块未启用或未连接")
 		}
-		return []string{"电话号码为空"}
+		return fmt.Errorf("电话号码为空")
 	}
 
 	phoneNumbers := parsePhoneNumbers(phoneNumbersStr)
 	if len(phoneNumbers) == 0 {
-		return []string{"电话号码为空"}
+		return fmt.Errorf("电话号码为空")
 	}
 
 	s.sendWechatNotification(name, phoneNumbers)
 
-	callDuration := s.config.EC600N.CallDuration
-	if callDuration <= 0 {
-		callDuration = 60
-	}
-
-	// 只处理第一个电话号码
-	firstResult := s.makePhoneCall(phoneNumbers[0], callDuration)
-
-	// 其他电话号码异步执行，不等待结果
-	if len(phoneNumbers) > 1 {
-		for _, phoneNumber := range phoneNumbers[1:] {
-			go func(num string) {
-				_ = s.makePhoneCall(num, callDuration)
-			}(phoneNumber)
+	go func() {
+		callDuration := s.config.EC600N.CallDuration
+		if callDuration <= 0 {
+			callDuration = 10
 		}
-		zap.S().Infof("已启动 %d 个异步拨打电话任务", len(phoneNumbers)-1)
-	}
 
-	return []string{firstResult}
+		for _, phoneNumber := range phoneNumbers[1:] {
+			zap.S().Infof("已启动 %d 个异步拨打电话任务", len(phoneNumbers)-1)
+			s.makePhoneCall(phoneNumber, callDuration)
+		}
+	}()
+
+	return nil
 }
 
 // handleNotify 处理 /api/nofity 请求
@@ -332,11 +288,10 @@ func (s *HTTPServer) handleNotify(w http.ResponseWriter, r *http.Request) {
 	zap.S().Infof("API请求验证成功: name=%s, phoneNumbers=%s, timestamp=%s",
 		req.Name, req.PhoneNumbers, req.Timestamp)
 
-	callResults := s.processPhoneCalls(req.Name, req.PhoneNumbers)
-
 	message := "验证成功"
-	if len(callResults) > 0 {
-		message = fmt.Sprintf("验证成功。拨打电话结果: %s", strings.Join(callResults, "; "))
+	if err := s.processPhoneCalls(req.Name, req.PhoneNumbers); err != nil {
+		message = fmt.Sprintf("验证成功，但拨打电话失败: %v", err)
+		zap.S().Warnf("拨打电话失败: %v", err)
 	}
 
 	w.WriteHeader(http.StatusOK)
