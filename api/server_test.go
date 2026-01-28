@@ -94,13 +94,13 @@ func TestHandleNotify_MillisecondTimestamp(t *testing.T) {
 func TestHttpNotify_MillisecondTimestamp(t *testing.T) {
 
 	// 准备请求数据
-	secretKey := ""
+	secretKey := "your-secret-key-here"
 	timestamp := fmt.Sprintf("%d", time.Now().UnixMilli())
-	signature := generateSignature("test", "13800138000", timestamp, secretKey)
+	signature := generateSignature("test", "13817795074", timestamp, secretKey)
 
 	reqBody := NotifyRequest{
 		Name:         "test",
-		PhoneNumbers: "13800138000",
+		PhoneNumbers: "13817795074",
 		Timestamp:    timestamp,
 		Signature:    signature,
 	}

@@ -216,27 +216,66 @@ func (s *HTTPServer) sendWechatNotification(name string, phoneNumbers []string) 
 	}
 }
 
-// makePhoneCall 拨打电话
-func (s *HTTPServer) makePhoneCall(phoneNumber string, duration int) string {
+// makePhoneCall 拨打电话并监听对方挂断
+func (s *HTTPServer) makePhoneCall(phoneNumber string, maxDuration int) string {
 	zap.S().Infof("开始拨打电话: %s", phoneNumber)
-	if err := s.ec600n.MakeCall(phoneNumber); err != nil {
+
+	// 使用带监听功能的拨号方法
+	statusChan, err := s.ec600n.MakeCallWithMonitor(phoneNumber)
+	if err != nil {
 		zap.S().Errorf("拨打电话失败 [%s]: %v", phoneNumber, err)
 		return fmt.Sprintf("%s: 失败 - %v", phoneNumber, err)
 	}
 
-	zap.S().Infof("通话中，等待 %d 秒后挂断...", duration)
-	time.Sleep(time.Duration(duration) * time.Second)
+	// 创建超时context
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(maxDuration)*time.Second)
+	defer cancel()
 
-	if err := s.ec600n.HangupCall(); err != nil {
-		zap.S().Errorf("挂断电话失败 [%s]: %v", phoneNumber, err)
-		return fmt.Sprintf("%s: 拨打成功但挂断失败 - %v", phoneNumber, err)
+	zap.S().Infof("通话中，监听对方挂断或等待 %d 秒后挂断...", maxDuration)
+
+	// 使用select监听两个事件：对方挂断或超时
+	select {
+	case status := <-statusChan:
+		// 检测到状态变化
+		switch status {
+		case ec600n.CallStatusNoCarrier:
+			zap.S().Infof("检测到对方已挂断: %s", phoneNumber)
+			return fmt.Sprintf("%s: 成功（对方已挂断）", phoneNumber)
+		case ec600n.CallStatusBusy:
+			zap.S().Warnf("对方忙线: %s", phoneNumber)
+			return fmt.Sprintf("%s: 对方忙线", phoneNumber)
+		case ec600n.CallStatusNoAnswer:
+			zap.S().Warnf("无人接听: %s", phoneNumber)
+			return fmt.Sprintf("%s: 无人接听", phoneNumber)
+		case ec600n.CallStatusError:
+			zap.S().Errorf("通话错误: %s", phoneNumber)
+			// 尝试挂断
+			if hangupErr := s.ec600n.HangupCall(); hangupErr != nil {
+				return fmt.Sprintf("%s: 通话错误且挂断失败 - %v", phoneNumber, hangupErr)
+			}
+			return fmt.Sprintf("%s: 通话错误", phoneNumber)
+		default:
+			zap.S().Infof("通话状态: %s, 电话: %s", status, phoneNumber)
+			// 继续等待或挂断
+			if hangupErr := s.ec600n.HangupCall(); hangupErr != nil {
+				return fmt.Sprintf("%s: 挂断失败 - %v", phoneNumber, hangupErr)
+			}
+			return fmt.Sprintf("%s: 成功", phoneNumber)
+		}
+	case <-ctx.Done():
+		// 超时，主动挂断
+		zap.S().Infof("通话超时，主动挂断: %s", phoneNumber)
+		if err := s.ec600n.HangupCall(); err != nil {
+			zap.S().Errorf("挂断电话失败 [%s]: %v", phoneNumber, err)
+			return fmt.Sprintf("%s: 超时但挂断失败 - %v", phoneNumber, err)
+		}
+		zap.S().Infof("电话已挂断: %s", phoneNumber)
+		return fmt.Sprintf("%s: 成功（超时挂断）", phoneNumber)
 	}
-
-	zap.S().Infof("电话已挂断: %s", phoneNumber)
-	return fmt.Sprintf("%s: 成功", phoneNumber)
 }
 
 // processPhoneCalls 处理拨打电话流程
+// 只处理第一个电话号码并返回结果，其他电话号码异步执行
 func (s *HTTPServer) processPhoneCalls(name string, phoneNumbersStr string) []string {
 	if phoneNumbersStr == "" || s.ec600n == nil || !s.ec600n.IsConnected() {
 		if s.ec600n == nil || !s.ec600n.IsConnected() {
@@ -258,11 +297,20 @@ func (s *HTTPServer) processPhoneCalls(name string, phoneNumbersStr string) []st
 		callDuration = 60
 	}
 
-	var results []string
-	for _, phoneNumber := range phoneNumbers {
-		results = append(results, s.makePhoneCall(phoneNumber, callDuration))
+	// 只处理第一个电话号码
+	firstResult := s.makePhoneCall(phoneNumbers[0], callDuration)
+
+	// 其他电话号码异步执行，不等待结果
+	if len(phoneNumbers) > 1 {
+		for _, phoneNumber := range phoneNumbers[1:] {
+			go func(num string) {
+				_ = s.makePhoneCall(num, callDuration)
+			}(phoneNumber)
+		}
+		zap.S().Infof("已启动 %d 个异步拨打电话任务", len(phoneNumbers)-1)
 	}
-	return results
+
+	return []string{firstResult}
 }
 
 // handleNotify 处理 /api/nofity 请求
