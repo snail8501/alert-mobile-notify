@@ -36,6 +36,10 @@ type Config struct {
 		MaxSize    int    `yaml:"maxSize"`
 		MaxBackups int    `yaml:"maxBackups"`
 	} `yaml:"logger"`
+	API struct {
+		SecretKey string `yaml:"secret_key"` // API签名密钥
+		HTTPPort  int    `yaml:"http_port"`  // HTTP服务端口
+	} `yaml:"api"`
 }
 
 // LoadConfig 从 YAML 文件加载配置

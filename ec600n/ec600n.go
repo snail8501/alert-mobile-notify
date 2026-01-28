@@ -5,24 +5,37 @@ import (
 	"alert-mobile-notify/notification"
 	"bufio"
 	"fmt"
-	"go.uber.org/zap"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/tarm/serial"
 	"go.uber.org/fx"
+	"go.uber.org/zap"
 )
 
 const (
-	// ATCommandTimeout AT 指令响应超时时间
-	ATCommandTimeout = 100 * time.Millisecond
-	// MaxResponseLines 最大响应行数
-	MaxResponseLines = 10
-	// MinSignalStrength 最小正常信号强度
-	MinSignalStrength = 5
-	// IMEILength IMEI 标准长度
-	IMEILength = 15
+	ATCommandTimeout  = 100 * time.Millisecond // AT 指令响应超时时间
+	MaxResponseLines  = 10                     // 最大响应行数
+	MinSignalStrength = 5                      // 最小正常信号强度
+	IMEILength        = 15                     // IMEI 标准长度
+)
+
+var (
+	// 预编译正则表达式，提升性能
+	reCSQ  = regexp.MustCompile(`\+CSQ:\s*(\d+),(\d+)`)
+	reCREG = regexp.MustCompile(`\+CREG:\s*\d+,(\d+)`)
+	reCOPS = regexp.MustCompile(`\+COPS:\s*\d+,\d+,"([^"]+)"`)
+	reIMEI = regexp.MustCompile(`^\d{15}$`)
+
+	// 网络注册状态码映射
+	networkRegStatusMap = map[string]string{
+		"0": "未注册",
+		"1": "已注册本地网络",
+		"2": "正在搜索",
+		"3": "注册被拒绝",
+		"5": "已注册漫游",
+	}
 )
 
 // NetworkStatus 网络状态信息
@@ -57,12 +70,10 @@ func NewEC600N(cfg *config.Config, notify *notification.WechatNotify) (*EC600N, 
 		notify:    notify,
 	}
 
-	// 初始化串口连接
 	if err := ec.initSerial(); err != nil {
 		return nil, fmt.Errorf("初始化串口失败: %w", err)
 	}
 
-	// 测试连接
 	if err := ec.testConnection(); err != nil {
 		return nil, fmt.Errorf("测试连接失败: %w", err)
 	}
@@ -109,25 +120,25 @@ func (e *EC600N) sendATCommand(command string) (string, error) {
 		return "", fmt.Errorf("串口未连接")
 	}
 
-	// 清空缓冲区
 	if err := e.port.Flush(); err != nil {
 		return "", fmt.Errorf("清空串口缓冲区失败: %w", err)
 	}
 
-	// 发送 AT 指令，添加回车换行
 	fullCommand := command + "\r\n"
 	if _, err := e.port.Write([]byte(fullCommand)); err != nil {
 		return "", fmt.Errorf("发送 AT 指令失败: %w", err)
 	}
 
-	// 等待响应
 	time.Sleep(ATCommandTimeout)
 
-	// 读取响应
+	return e.readResponse()
+}
+
+// readResponse 读取串口响应
+func (e *EC600N) readResponse() (string, error) {
 	reader := bufio.NewReader(e.port)
 	var response strings.Builder
 
-	// 读取多行响应
 	for i := 0; i < MaxResponseLines; i++ {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -135,7 +146,7 @@ func (e *EC600N) sendATCommand(command string) (string, error) {
 		}
 		response.WriteString(line)
 
-		// 如果包含 OK 或 ERROR，说明响应结束
+		// 响应结束标志
 		if strings.Contains(line, "OK") || strings.Contains(line, "ERROR") {
 			break
 		}
@@ -150,86 +161,54 @@ func (e *EC600N) CheckNetworkStatus() (*NetworkStatus, error) {
 		Timestamp: time.Now(),
 	}
 
-	// 检查信号强度
-	if signal, err := e.getSignalStrength(); err == nil {
-		status.SignalStrength = signal
-	}
-
-	// 检查网络注册状态
-	if regStatus, err := e.getNetworkRegistrationStatus(); err == nil {
-		status.NetworkRegStatus = regStatus
-	}
-
-	// 检查SIM卡状态
-	if simStatus, err := e.getSIMStatus(); err == nil {
-		status.SIMStatus = simStatus
-	}
-
-	// 获取运营商名称
-	if operator, err := e.getOperatorName(); err == nil {
-		status.OperatorName = operator
-	}
-
-	// 获取IMEI
-	if imei, err := e.getIMEI(); err == nil {
-		status.IMEI = imei
-	}
+	// 收集各项状态信息（忽略错误，尽可能收集可用信息）
+	status.SignalStrength, _ = e.getSignalStrength()
+	status.NetworkRegStatus, _ = e.getNetworkRegistrationStatus()
+	status.SIMStatus, _ = e.getSIMStatus()
+	status.OperatorName, _ = e.getOperatorName()
+	status.IMEI, _ = e.getIMEI()
 
 	return status, nil
 }
 
-// getSignalStrength 获取信号强度
-// 返回信号强度值 (0-31, 99表示未知)
+// getSignalStrength 获取信号强度 (0-31, 99表示未知)
 func (e *EC600N) getSignalStrength() (int, error) {
 	response, err := e.sendATCommand("AT+CSQ")
 	if err != nil {
 		return 0, fmt.Errorf("发送 AT+CSQ 指令失败: %w", err)
 	}
 
-	// 解析响应: +CSQ: 15,99
-	re := regexp.MustCompile(`\+CSQ:\s*(\d+),(\d+)`)
-	matches := re.FindStringSubmatch(response)
-	if len(matches) >= 3 {
-		var signal int
-		if _, err := fmt.Sscanf(matches[1], "%d", &signal); err != nil {
-			return 0, fmt.Errorf("解析信号强度数值失败: %w", err)
-		}
-		return signal, nil
+	matches := reCSQ.FindStringSubmatch(response)
+	if len(matches) < 3 {
+		return 0, fmt.Errorf("无法解析信号强度，响应: %s", response)
 	}
 
-	return 0, fmt.Errorf("无法解析信号强度，响应: %s", response)
+	var signal int
+	if _, err := fmt.Sscanf(matches[1], "%d", &signal); err != nil {
+		return 0, fmt.Errorf("解析信号强度数值失败: %w", err)
+	}
+
+	return signal, nil
 }
 
 // getNetworkRegistrationStatus 获取网络注册状态
-// 返回网络注册状态的文本描述
 func (e *EC600N) getNetworkRegistrationStatus() (string, error) {
 	response, err := e.sendATCommand("AT+CREG?")
 	if err != nil {
 		return "", fmt.Errorf("发送 AT+CREG 指令失败: %w", err)
 	}
 
-	// 解析响应: +CREG: 0,1
-	re := regexp.MustCompile(`\+CREG:\s*\d+,(\d+)`)
-	matches := re.FindStringSubmatch(response)
-	if len(matches) >= 2 {
-		status := matches[1]
-		switch status {
-		case "0":
-			return "未注册", nil
-		case "1":
-			return "已注册本地网络", nil
-		case "2":
-			return "正在搜索", nil
-		case "3":
-			return "注册被拒绝", nil
-		case "5":
-			return "已注册漫游", nil
-		default:
-			return "未知状态", nil
-		}
+	matches := reCREG.FindStringSubmatch(response)
+	if len(matches) < 2 {
+		return "", fmt.Errorf("无法解析注册状态，响应: %s", response)
 	}
 
-	return "", fmt.Errorf("无法解析注册状态，响应: %s", response)
+	statusCode := matches[1]
+	if status, ok := networkRegStatusMap[statusCode]; ok {
+		return status, nil
+	}
+
+	return "未知状态", nil
 }
 
 // getSIMStatus 获取SIM卡状态
@@ -239,13 +218,14 @@ func (e *EC600N) getSIMStatus() (string, error) {
 		return "", err
 	}
 
-	if strings.Contains(response, "READY") {
+	switch {
+	case strings.Contains(response, "READY"):
 		return "就绪", nil
-	} else if strings.Contains(response, "SIM PIN") {
+	case strings.Contains(response, "SIM PIN"):
 		return "需要PIN码", nil
-	} else if strings.Contains(response, "SIM PUK") {
+	case strings.Contains(response, "SIM PUK"):
 		return "需要PUK码", nil
-	} else {
+	default:
 		return "未知状态", nil
 	}
 }
@@ -257,14 +237,12 @@ func (e *EC600N) getOperatorName() (string, error) {
 		return "", err
 	}
 
-	// 解析响应: +COPS: 0,0,"CHINA MOBILE"
-	re := regexp.MustCompile(`\+COPS:\s*\d+,\d+,"([^"]+)"`)
-	matches := re.FindStringSubmatch(response)
-	if len(matches) >= 2 {
-		return matches[1], nil
+	matches := reCOPS.FindStringSubmatch(response)
+	if len(matches) < 2 {
+		return "", fmt.Errorf("无法解析运营商名称: %s", response)
 	}
 
-	return "", fmt.Errorf("无法解析运营商名称: %s", response)
+	return matches[1], nil
 }
 
 // getIMEI 获取设备 IMEI
@@ -278,13 +256,44 @@ func (e *EC600N) getIMEI() (string, error) {
 	lines := strings.Split(response, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		// IMEI 长度为 15 且全部为数字
-		if len(line) == IMEILength && strings.IndexAny(line, "0123456789") == 0 {
+		if len(line) == IMEILength && reIMEI.MatchString(line) {
 			return line, nil
 		}
 	}
 
 	return "", fmt.Errorf("无法解析 IMEI，响应: %s", response)
+}
+
+// MakeCall 拨打电话
+// 使用 ATD 指令拨打电话号码
+func (e *EC600N) MakeCall(phoneNumber string) error {
+	if e.port == nil {
+		return fmt.Errorf("串口未连接")
+	}
+
+	// 清理电话号码，移除空格和特殊字符
+	phoneNumber = strings.TrimSpace(phoneNumber)
+	phoneNumber = strings.ReplaceAll(phoneNumber, "-", "")
+	phoneNumber = strings.ReplaceAll(phoneNumber, " ", "")
+
+	if phoneNumber == "" {
+		return fmt.Errorf("电话号码不能为空")
+	}
+
+	// 发送拨号指令 ATD<number>;
+	command := fmt.Sprintf("ATD%s;", phoneNumber)
+	response, err := e.sendATCommand(command)
+	if err != nil {
+		return fmt.Errorf("发送拨号指令失败: %w", err)
+	}
+
+	// 检查响应
+	if strings.Contains(response, "OK") || strings.Contains(response, "CONNECT") {
+		zap.S().Infof("拨打电话成功: %s", phoneNumber)
+		return nil
+	}
+
+	return fmt.Errorf("拨打电话失败，响应: %s", response)
 }
 
 // HangupCall 挂断电话
@@ -294,11 +303,11 @@ func (e *EC600N) HangupCall() error {
 		return fmt.Errorf("挂断电话失败: %w", err)
 	}
 
-	if strings.Contains(response, "OK") {
-		return nil
+	if !strings.Contains(response, "OK") {
+		return fmt.Errorf("挂断电话失败，响应: %s", response)
 	}
 
-	return fmt.Errorf("挂断电话失败，响应: %s", response)
+	return nil
 }
 
 // Close 关闭连接
@@ -320,7 +329,6 @@ func (e *EC600N) StartNetworkMonitoring() error {
 	status, err := e.CheckNetworkStatus()
 	if err != nil {
 		zap.S().Errorf("检查网络状态失败: %v", err)
-		// 发送网络检查失败通知
 		message := fmt.Sprintf("EC600N 网络检查失败: %v\n时间: %s",
 			err, time.Now().Format("2006-01-02 15:04:05"))
 		if notifyErr := e.notify.SendToWechat(message); notifyErr != nil {
@@ -329,14 +337,11 @@ func (e *EC600N) StartNetworkMonitoring() error {
 		return fmt.Errorf("检查网络状态失败: %w", err)
 	}
 
-	// 检查网络状态是否正常
-	isNormal := e.isNetworkStatusNormal(status)
 	statusText := "正常"
-	if !isNormal {
+	if !e.isNetworkStatusNormal(status) {
 		statusText = "异常"
 	}
 
-	// 格式化并发送网络状态报告
 	message := fmt.Sprintf("EC600N 网络状态报告\n状态: %s\n%s",
 		statusText, e.formatNetworkStatus(status))
 

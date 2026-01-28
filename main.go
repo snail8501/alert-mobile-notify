@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"alert-mobile-notify/api"
 	"alert-mobile-notify/config"
 	"alert-mobile-notify/ec600n"
 	"alert-mobile-notify/notification"
@@ -32,6 +33,8 @@ func main() {
 		notification.ProvideWechatNotify(),
 		// EC600N模块
 		ec600n.ProvideEC600N(),
+		// HTTP API服务器模块
+		api.ProvideHTTPServer(),
 		// 启动调度器
 		fx.Invoke(config.InitLogger, initScheduler),
 	)
