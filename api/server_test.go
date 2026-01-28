@@ -17,31 +17,6 @@ import (
 	"time"
 )
 
-// generateSignature 生成签名（用于测试）
-func generateSignature(name, phoneNumbers, timestamp, secretKey string) string {
-	params := map[string]string{
-		"name":         name,
-		"phoneNumbers": phoneNumbers,
-		"secretKey":    secretKey,
-		"timestamp":    timestamp,
-	}
-
-	keys := make([]string, 0, len(params))
-	for k := range params {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var parts []string
-	for _, k := range keys {
-		parts = append(parts, fmt.Sprintf("%s=%s", k, params[k]))
-	}
-	signString := strings.Join(parts, "&")
-
-	hash := md5.Sum([]byte(signString))
-	return hex.EncodeToString(hash[:])
-}
-
 // TestHandleNotify_MillisecondTimestamp 测试毫秒级时间戳
 func TestHandleNotify_MillisecondTimestamp(t *testing.T) {
 
@@ -94,7 +69,7 @@ func TestHandleNotify_MillisecondTimestamp(t *testing.T) {
 func TestHttpNotify_MillisecondTimestamp(t *testing.T) {
 
 	// 准备请求数据
-	secretKey := "your-secret-key-here"
+	secretKey := "k7mP9xQrT2vN8sL4wY6a"
 	timestamp := fmt.Sprintf("%d", time.Now().UnixMilli())
 	signature := generateSignature("test", "13817795074", timestamp, secretKey)
 
@@ -127,4 +102,29 @@ func TestHttpNotify_MillisecondTimestamp(t *testing.T) {
 	if !response.Success {
 		t.Error("期望 Success 为 true")
 	}
+}
+
+// generateSignature 生成签名（用于测试）
+func generateSignature(name, phoneNumbers, timestamp, secretKey string) string {
+	params := map[string]string{
+		"name":         name,
+		"phoneNumbers": phoneNumbers,
+		"secretKey":    secretKey,
+		"timestamp":    timestamp,
+	}
+
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var parts []string
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%s", k, params[k]))
+	}
+	signString := strings.Join(parts, "&")
+
+	hash := md5.Sum([]byte(signString))
+	return hex.EncodeToString(hash[:])
 }

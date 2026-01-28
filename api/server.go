@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/fx"
@@ -47,6 +48,10 @@ type HTTPServer struct {
 	secretKey string
 	ec600n    *ec600n.EC600N
 	notify    *notification.WechatNotify
+
+	// 电话拨打状态控制
+	callMu  sync.Mutex
+	calling bool
 }
 
 // NewHTTPServer 创建新的HTTP服务器
@@ -237,7 +242,6 @@ func (s *HTTPServer) makePhoneCall(phoneNumber string, duration int) string {
 }
 
 // processPhoneCalls 处理拨打电话流程
-// 只处理第一个电话号码并返回结果，其他电话号码异步执行
 func (s *HTTPServer) processPhoneCalls(name string, phoneNumbersStr string) error {
 	if phoneNumbersStr == "" || s.ec600n == nil || !s.ec600n.IsConnected() {
 		if s.ec600n == nil || !s.ec600n.IsConnected() {
@@ -254,14 +258,29 @@ func (s *HTTPServer) processPhoneCalls(name string, phoneNumbersStr string) erro
 
 	s.sendWechatNotification(name, phoneNumbers)
 
+	// 检查是否已有拨号任务在执行
+	s.callMu.Lock()
+	if s.calling {
+		s.callMu.Unlock()
+		return fmt.Errorf("已有任务在处理")
+	}
+	s.calling = true
+	s.callMu.Unlock()
+
 	go func() {
+		defer func() {
+			s.callMu.Lock()
+			s.calling = false
+			s.callMu.Unlock()
+		}()
+
 		callDuration := s.config.EC600N.CallDuration
 		if callDuration <= 0 {
 			callDuration = 10
 		}
 
-		for _, phoneNumber := range phoneNumbers[1:] {
-			zap.S().Infof("已启动 %d 个异步拨打电话任务", len(phoneNumbers)-1)
+		for _, phoneNumber := range phoneNumbers {
+			zap.S().Infof("开始执行拨打电话任务，当前号码: %s，总任务数: %d", phoneNumber, len(phoneNumbers))
 			s.makePhoneCall(phoneNumber, callDuration)
 		}
 	}()
@@ -290,8 +309,11 @@ func (s *HTTPServer) handleNotify(w http.ResponseWriter, r *http.Request) {
 
 	message := "验证成功"
 	if err := s.processPhoneCalls(req.Name, req.PhoneNumbers); err != nil {
-		message = fmt.Sprintf("验证成功，但拨打电话失败: %v", err)
-		zap.S().Warnf("拨打电话失败: %v", err)
+		if strings.Contains(err.Error(), "已有任务在处理") {
+			s.writeErrorResponse(w, http.StatusServiceUnavailable, "已有任务在处理")
+			return
+		}
+		message = fmt.Sprintf("拨打电话失败: %s", err.Error())
 	}
 
 	w.WriteHeader(http.StatusOK)
